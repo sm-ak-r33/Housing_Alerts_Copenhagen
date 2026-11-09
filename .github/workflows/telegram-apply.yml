@@ -1,0 +1,42 @@
+name: Telegram Application Listener
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC. A 245-minute listener overlaps the next four-hour trigger, which queues.
+    # GitHub scheduling/runner startup can still leave gaps; this is not guaranteed uptime.
+    - cron: '17 */4 * * *'
+
+concurrency:
+  group: telegram-application-listener
+  cancel-in-progress: false
+
+permissions:
+  contents: write # Durable, hash-only application ledger on bot-application-state.
+
+jobs:
+  listen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 270
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - name: Listen for authorized replies
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
+          DAB_APPLICANT_JSON: ${{ secrets.DAB_APPLICANT_JSON }}
+          DAB_SUBMIT_ENABLED: ${{ vars.DAB_SUBMIT_ENABLED }}
+          GITHUB_TOKEN: ${{ github.token }}
+          LISTENER_SECONDS: '14700'
+          APPLY_MAX_AGE_SECONDS: '900'
+        run: npm run listen:applications

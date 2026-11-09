@@ -543,6 +543,10 @@ function buildListingsMessage(title, listings) {
 
   lines.push("Source:");
   lines.push(APARTMENT_URL);
+  lines.push("");
+  lines.push("Reply to this notification: apply 1 (use the listing number shown above).");
+  lines.push("Or reply: apply <street and number>, <postcode> <city>.");
+  lines.push("In live mode this submits an application immediately. Use /status to check the mode.");
 
   return lines.join("\n");
 }
@@ -853,7 +857,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+module.exports = { buildListingsMessage, splitMessage };

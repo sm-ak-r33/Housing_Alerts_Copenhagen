@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "check": "node src/check-apartments.js",
-    "check:waitly": "node src/check-waitly.js"
+    "check:waitly": "node src/check-waitly.js",
+    "listen:applications": "node src/telegram-apply.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "playwright": "^1.56.0",

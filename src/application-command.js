@@ -5,7 +5,8 @@ const clean = value => String(value || '').normalize('NFC').replace(/\s+/g, ' ')
 
 // Deliberately conservative. An unclear scraped title must never become an application.
 function parseAddress(value) {
-  const text = clean(value);
+  // This badge is sometimes included in scraped listing titles.
+  const text = clean(value).replace(/^Fleksible kriterier\s+/iu, '');
   const match = text.match(/^([\p{L}][\p{L} .’'\-]{1,79}\s+\d{1,4}[A-Za-zÆØÅæøå]?(?:\s*,?\s*(?:\d{1,3}\.?|st\.?|sal|tv\.?|th\.?|mf\.?|dør|[A-Za-z])){0,6})\s*,\s*([1-9]\d{3})\s+([\p{L}][\p{L} .’'\-]{0,59})$/iu);
   if (!match || /husleje|indskud|udlejningsperiode|rental period|https|\n/i.test(text)) {
     throw new Error('Use a full address, e.g. apply Eksempelvej 12, 2. tv., 2500 Valby.');

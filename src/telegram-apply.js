@@ -1,5 +1,5 @@
 const { authorize, parseCommand, addressKey, addressText } = require('./application-command');
-const { loadProfile, applyForHousing, FORM_URL } = require('./dab-application');
+const { loadProfile, applyForHousing, preparationReason, FORM_URL } = require('./dab-application');
 const { GitHubState, LocalState } = require('./application-state');
 
 const HELP = 'Reply directly to a DAB-Lejerbo notification:\napply 1 — select listing 1\napply — if it has just one listing\napply Eksempelvej 12, 2. tv., 2500 Valby — supply the exact address\nA full address alone in a reply also works.\n/status — show mode and ledger counts.\nIn live mode, an apply reply submits immediately without another confirmation.';
@@ -57,10 +57,10 @@ async function handleUpdate(update, { config, store, send, apply = applyForHousi
         reserved = true;
       },
     });
-  } catch {
+  } catch (error) {
     if (stateFailure) throw new Error('State reservation failed. No submit click was authorized.');
     if (!reserved) {
-      await send(`Could not prepare the form; no submit click was made. Check DAB_APPLICANT_JSON, the form layout, or CAPTCHA.\n${FORM_URL}`);
+      await send(`Could not prepare the form; no submit click was made. ${preparationReason(error)}\n${FORM_URL}`);
       return;
     }
     result = { status: 'unknown' };

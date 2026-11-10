@@ -2,6 +2,32 @@ const { chromium } = require('playwright');
 const FORM_URL = 'https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/blanket-til-tidsbegraenset-bolig/';
 const SUBMIT_PATH = '/api/forms/SubmitForm';
 
+// Only fixed messages are exposed to Telegram; Playwright errors can contain PII.
+const PREPARATION_MESSAGES = Object.freeze({
+  OPEN_FORM: 'The application page or form did not become ready.',
+  COUNTRY: 'The country controls changed or are not set to Danmark.',
+  ADDRESS: 'The address fields changed or could not be filled.',
+  CITY_LOOKUP: 'Postcode lookup did not finish. The site did not autofill and lock the city fields.',
+  CITY_MISMATCH: 'The city returned by the site does not match the supplied postcode/city. Check both addresses.',
+  APPLICANT: 'An applicant field could not be found or filled.',
+  DATE: 'A birth-date field could not be filled or did not retain DD/MM/YYYY.',
+  CAPTCHA: 'CAPTCHA requires a manual application.',
+  VALIDATION: 'The form did not become valid. Check applicant details and address lookup.',
+});
+class PreparationError extends Error {
+  constructor(code) {
+    super(PREPARATION_MESSAGES[code]);
+    this.name = 'PreparationError';
+    this.code = code;
+  }
+}
+function preparationReason(error) {
+  return error instanceof PreparationError
+    ? `[${error.code}] ${PREPARATION_MESSAGES[error.code]}`
+    : '[PREPARATION_FAILED] Browser startup or an unexpected preparation step failed.';
+}
+const normalizeCity = value => value.normalize('NFC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('da-DK');
+
 function loadProfile(raw) {
   let p;
   try { p = JSON.parse(raw); } catch { throw new Error('DAB_APPLICANT_JSON must be valid JSON.'); }
@@ -31,60 +57,90 @@ function confirmedResponse(status, body) {
 }
 
 async function fillApplication(page, address, profile) {
-  await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  const form = page.locator('form').filter({ has: page.getByText('Tidsbegrænsede lejemål', { exact: true }) });
-  await form.waitFor({ state: 'visible', timeout: 45000 });
-  const cookie = page.getByRole('button', { name: 'Accepter kun de nødvendige cookies', exact: true });
-  if (await cookie.isVisible()) await cookie.click();
-  if (await form.count() !== 1) throw new Error('Application form structure changed.');
+  let stage = 'OPEN_FORM';
+  try {
+    await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const form = page.locator('form').filter({ has: page.getByText('Tidsbegrænsede lejemål', { exact: true }) });
+    await form.waitFor({ state: 'visible', timeout: 45000 });
+    const cookie = page.getByRole('button', { name: 'Accepter kun de nødvendige cookies', exact: true });
+    if (await cookie.isVisible()) await cookie.click();
+    if (await form.count() !== 1) throw new Error('Application form structure changed.');
 
-  const countries = form.locator('bex-autocomplete[formcontrolname="country"]');
-  if (await countries.count() !== 2) throw new Error('Address structure changed.');
-  for (const country of await countries.all()) {
-    if (!/Danmark/.test(await country.innerText())) throw new Error('Country is not Danmark; fill this application manually.');
+    stage = 'COUNTRY';
+    const countries = form.locator('bex-autocomplete[formcontrolname="country"]');
+    if (await countries.count() !== 2) throw new Error('Address structure changed.');
+    for (const country of await countries.all()) {
+      if (!/Danmark/.test(await country.innerText())) throw new Error('Country is not Danmark; fill this application manually.');
+    }
+    stage = 'ADDRESS';
+    const postcodes = form.locator('bex-input[formcontrolname="zipCode"] input');
+    const cities = form.locator('bex-input[formcontrolname="city"] input');
+    const streets = form.locator('bex-input[formcontrolname="streetAndLocation"] input');
+    for (const inputs of [postcodes, cities, streets]) {
+      if (await inputs.count() !== 2) throw new PreparationError('ADDRESS');
+    }
+    await postcodes.nth(0).fill(address.postcode);
+    await postcodes.nth(1).fill(profile.current_postcode);
+    await postcodes.nth(1).press('Tab');
+
+    // Denmark's postcode lookup fills and disables city asynchronously.
+    // Never race it by typing into city, or silently accept a different city.
+    stage = 'CITY_LOOKUP';
+    await page.waitForFunction(el => {
+      const inputs = [...el.querySelectorAll('bex-input[formcontrolname="city"] input')];
+      return inputs.length === 2 && inputs.every(input => input.disabled && input.value.trim());
+    }, await form.elementHandle(), { timeout: 20000 });
+    const expectedCities = [address.city, profile.current_city];
+    for (let i = 0; i < 2; i++) {
+      if (normalizeCity(await cities.nth(i).inputValue()) !== normalizeCity(expectedCities[i])) {
+        throw new PreparationError('CITY_MISMATCH');
+      }
+    }
+    stage = 'ADDRESS';
+    await streets.nth(0).fill(address.street);
+    await streets.nth(1).fill(profile.current_street);
+    stage = 'APPLICANT';
+    // Labels are visually present but some inputs lack HTML label associations.
+    for (const [label, value] of [
+      [/^Dit navn\*/, profile.name], [/^Mailadresse\*/, profile.email],
+      [/^Dit telefonnummer\*/, profile.phone],
+      [/^Navn på evt\. samlever, der også skal bo i boligen$/, profile.partner_name || ''],
+    ]) {
+      const field = form.locator('bex-input').filter({ hasText: label }).locator('input');
+      if (await field.count() !== 1) throw new Error('Applicant fields changed.');
+      await field.fill(value);
+    }
+    stage = 'DATE';
+    for (const [label, value] of [
+      [/^Din fødselsdato$/, profile.birth_date],
+      [/^Fødselsdato på evt\. samlever, der også skal bo i boligen$/, profile.partner_birth_date],
+    ]) {
+      if (!value) continue;
+      const field = form.locator('bex-datepicker').filter({ hasText: label }).locator('input');
+      await field.fill(value);
+      await field.press('Tab');
+      if (await field.inputValue() !== value) throw new Error('Date input was not accepted.');
+    }
+    stage = 'APPLICANT';
+    await form.locator('input[type="tel"]').press('Tab');
+    if (await page.locator('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],.g-recaptcha').count()) {
+      throw new PreparationError('CAPTCHA');
+    }
+    // The live component uses novalidate and renders pattern="null" on ordinary
+    // inputs. Native checkValidity() therefore rejects legitimate text: use the
+    // Angular form/control validity which the site's own Send action uses.
+    stage = 'VALIDATION';
+    await page.waitForFunction(el =>
+      el.classList.contains('ng-valid') &&
+      !el.classList.contains('ng-invalid') &&
+      !el.classList.contains('ng-pending') &&
+      !el.querySelector('.ng-invalid,.ng-pending'),
+      await form.elementHandle(), { timeout: 20000 });
+    return page.getByRole('button', { name: 'Send', exact: true }).filter({ visible: true });
+  } catch (error) {
+    if (error instanceof PreparationError) throw error;
+    throw new PreparationError(stage);
   }
-  const fields = [
-    ['zipCode', [address.postcode, profile.current_postcode]],
-    ['city', [address.city, profile.current_city]],
-    ['streetAndLocation', [address.street, profile.current_street]],
-  ];
-  for (const [control, values] of fields) {
-    const inputs = form.locator(`bex-input[formcontrolname="${control}"] input`);
-    if (await inputs.count() !== 2) throw new Error('Address fields changed.');
-    for (let i = 0; i < 2; i++) await inputs.nth(i).fill(values[i]);
-  }
-  // Labels are visually present but some inputs lack HTML label associations.
-  for (const [label, value] of [
-    [/^Dit navn\*/, profile.name], [/^Mailadresse\*/, profile.email],
-    [/^Dit telefonnummer\*/, profile.phone],
-    [/^Navn på evt\. samlever, der også skal bo i boligen$/, profile.partner_name || ''],
-  ]) {
-    const field = form.locator('bex-input').filter({ hasText: label }).locator('input');
-    if (await field.count() !== 1) throw new Error('Applicant fields changed.');
-    await field.fill(value);
-  }
-  for (const [label, value] of [
-    [/^Din fødselsdato$/, profile.birth_date],
-    [/^Fødselsdato på evt\. samlever, der også skal bo i boligen$/, profile.partner_birth_date],
-  ]) {
-    if (!value) continue;
-    const field = form.locator('bex-datepicker').filter({ hasText: label }).locator('input');
-    await field.fill(value);
-    await field.press('Tab');
-    if (await field.inputValue() !== value) throw new Error('Date input was not accepted.');
-  }
-  await form.locator('input[type="tel"]').press('Tab');
-  if (await page.locator('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],.g-recaptcha').count()) {
-    throw new Error('CAPTCHA requires a manual application.');
-  }
-  // The live component uses novalidate and renders pattern="null" on ordinary
-  // inputs. Native checkValidity() therefore rejects legitimate text: use the
-  // Angular form/control validity which the site's own Send action uses.
-  if (await form.locator('bex-input.ng-invalid,bex-datepicker.ng-invalid,bex-autocomplete.ng-invalid').count() ||
-      !(await form.evaluate(el => el.classList.contains('ng-valid') && !el.classList.contains('ng-invalid')))) {
-    throw new Error('The site rejected one or more fields; check your applicant settings.');
-  }
-  return page.getByRole('button', { name: 'Send', exact: true }).filter({ visible: true });
 }
 
 async function applyForHousing(address, profile, { dryRun = true, beforeSubmit = async () => {}, launch = () => chromium.launch({ headless: true }) } = {}) {
@@ -122,4 +178,4 @@ async function applyForHousing(address, profile, { dryRun = true, beforeSubmit =
   } finally { await browser.close().catch(() => {}); }
 }
 
-module.exports = { FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };
+module.exports = { PreparationError, preparationReason, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };

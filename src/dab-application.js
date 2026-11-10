@@ -6,7 +6,10 @@ const SUBMIT_PATH = '/api/forms/SubmitForm';
 // postcode/city pair in the already-authorized Telegram chat, not logs.
 const PREPARATION_MESSAGES = Object.freeze({
   OPEN_FORM: 'The application page or form did not become ready.',
-  COUNTRY: 'The country controls changed or are not set to Danmark.',
+  COUNTRY: 'Could not read the country controls.',
+  COUNTRY_STRUCTURE: 'The expected two country controls did not appear within 45 seconds.',
+  COUNTRY_NOT_READY: 'The country controls appeared, but their selected values did not load within 45 seconds.',
+  COUNTRY_VALUE: 'Both addresses must have Danmark selected.',
   ADDRESS: 'The address fields changed or could not be filled.',
   CITY_LOOKUP: 'Postcode lookup did not finish. The site did not autofill and lock the city fields.',
   CITY_MISMATCH: 'The city returned by the site does not match the supplied postcode/city. Check both addresses.',
@@ -27,6 +30,13 @@ function preparationReason(error) {
   if (!(error instanceof PreparationError)) {
     return '[PREPARATION_FAILED] Browser startup or an unexpected preparation step failed.';
   }
+  if (['COUNTRY_STRUCTURE', 'COUNTRY_NOT_READY', 'COUNTRY_VALUE'].includes(error.code) && error.details) {
+    const { count, selections } = error.details;
+    const safe = value => JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 80));
+    return `[${error.code}] ${PREPARATION_MESSAGES[error.code]} ` +
+      `Controls found: ${count}. Selected countries (listing, current): ` +
+      selections.map(value => safe(value || '(not loaded)')).join(', ') + '.';
+  }
   if (error.code === 'CITY_MISMATCH' && error.details) {
     // Keep diagnostics single-line, bounded and restricted to known fields.
     const safe = value => JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 100));
@@ -45,6 +55,24 @@ function validateCityMatch(addressType, postcode, suppliedCity, siteCity) {
   if (normalizeCity(siteCity) !== normalizeCity(suppliedCity)) {
     throw new PreparationError('CITY_MISMATCH', { addressType, postcode, suppliedCity, siteCity });
   }
+}
+
+// A visible form heading does not mean the custom controls have hydrated.
+// Read the selected button only: dropdown options may also contain "Danmark".
+async function waitForCountrySelection(readSelections, { timeoutMs = 45000, intervalMs = 200 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let selections = [];
+  while (true) {
+    selections = await readSelections();
+    if (selections.length === 2 && selections.every(value =>
+      String(value || '').normalize('NFC').trim().toLocaleLowerCase('da-DK') === 'danmark')) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  }
+  const code = selections.length !== 2 ? 'COUNTRY_STRUCTURE'
+    : selections.some(value => !String(value || '').trim()) ? 'COUNTRY_NOT_READY' : 'COUNTRY_VALUE';
+  throw new PreparationError(code, { count: selections.length, selections: selections.slice(0, 2) });
 }
 
 function loadProfile(raw) {
@@ -86,11 +114,11 @@ async function fillApplication(page, address, profile) {
     if (await form.count() !== 1) throw new Error('Application form structure changed.');
 
     stage = 'COUNTRY';
-    const countries = form.locator('bex-autocomplete[formcontrolname="country"]');
-    if (await countries.count() !== 2) throw new Error('Address structure changed.');
-    for (const country of await countries.all()) {
-      if (!/Danmark/.test(await country.innerText())) throw new Error('Country is not Danmark; fill this application manually.');
-    }
+    await waitForCountrySelection(() =>
+      form.locator('bex-autocomplete[formcontrolname="country"]').evaluateAll(elements =>
+        elements.map(element => element.querySelector('button[aria-haspopup="listbox"]')?.innerText?.trim() || '')
+      )
+    );
     stage = 'ADDRESS';
     const postcodes = form.locator('bex-input[formcontrolname="zipCode"] input');
     const cities = form.locator('bex-input[formcontrolname="city"] input');
@@ -199,4 +227,4 @@ async function applyForHousing(address, profile, { dryRun = true, beforeSubmit =
   } finally { await browser.close().catch(() => {}); }
 }
 
-module.exports = { PreparationError, preparationReason, validateCityMatch, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };
+module.exports = { waitForCountrySelection, PreparationError, preparationReason, validateCityMatch, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };

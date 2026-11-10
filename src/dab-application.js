@@ -11,6 +11,8 @@ const PREPARATION_MESSAGES = Object.freeze({
   COUNTRY_NOT_READY: 'The country controls appeared, but their selected values did not load within 45 seconds.',
   COUNTRY_VALUE: 'Both addresses must have Danmark selected.',
   ADDRESS: 'The address fields changed or could not be filled.',
+  ADDRESS_SELECTION: 'The address autocomplete could not confirm the exact address.',
+  ADDRESS_CHANGED: 'An address field changed unexpectedly during autocomplete.',
   CITY_LOOKUP: 'Postcode lookup did not finish. The site did not autofill and lock the city fields.',
   CITY_MISMATCH: 'The city returned by the site does not match the supplied postcode/city. Check both addresses.',
   APPLICANT: 'An applicant field could not be found or filled.',
@@ -29,6 +31,19 @@ class PreparationError extends Error {
 function preparationReason(error) {
   if (!(error instanceof PreparationError)) {
     return '[PREPARATION_FAILED] Browser startup or an unexpected preparation step failed.';
+  }
+  if (error.code === 'ADDRESS_SELECTION' && error.details) {
+    const label = error.details.addressType === 'current' ? 'Your current address (current_street)' : 'The listing address';
+    const reason = error.details.reason === 'ambiguous' ? 'Multiple suggestions matched.'
+      : error.details.reason === 'selection_invalid' ? 'The selected suggestion did not validate the address group.'
+      : 'No exact matching suggestion or valid manual address was accepted before timeout.';
+    return `[ADDRESS_SELECTION] ${label}: ${reason} Include the full street, house number, floor and door where applicable.`;
+  }
+  if (error.code === 'VALIDATION' && error.details) {
+    const { formState, problems } = error.details;
+    return `[VALIDATION] Form state: ${formState}. ` +
+      (problems.length ? `Invalid/pending fields or groups: ${problems.join('; ')}.`
+        : 'No invalid visible field was identified; an internal form control may still be invalid.');
   }
   if (['COUNTRY_STRUCTURE', 'COUNTRY_NOT_READY', 'COUNTRY_VALUE'].includes(error.code) && error.details) {
     const { count, selections } = error.details;
@@ -73,6 +88,92 @@ async function waitForCountrySelection(readSelections, { timeoutMs = 45000, inte
   const code = selections.length !== 2 ? 'COUNTRY_STRUCTURE'
     : selections.some(value => !String(value || '').trim()) ? 'COUNTRY_NOT_READY' : 'COUNTRY_VALUE';
   throw new PreparationError(code, { count: selections.length, selections: selections.slice(0, 2) });
+}
+
+// Preserve token boundaries: "8 7 1" must not match "8 71" or "8 7 11".
+const normalizeStreet = value => String(value).normalize('NFC').toLocaleLowerCase('da-DK')
+  .replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim();
+
+async function resolveAddressSelection(readState, clickOption, street, addressType,
+  { timeoutMs = 20000, intervalMs = 200 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let selected = false;
+  while (true) {
+    const state = await readState();
+    if (normalizeStreet(state.street) !== normalizeStreet(street)) throw new PreparationError('ADDRESS_CHANGED');
+    if (selected) {
+      if (state.valid) return;
+    } else {
+      const matches = state.options.filter(text => normalizeStreet(text) === normalizeStreet(street));
+      if (matches.length > 1) throw new PreparationError('ADDRESS_SELECTION', { addressType, reason: 'ambiguous' });
+      if (matches.length === 1) {
+        // Do not press Enter: if the menu vanished, it could submit the form.
+        await clickOption(matches[0]);
+        selected = true;
+        continue;
+      }
+      // The site's component explicitly accepts manual input when its search
+      // returns zero suggestions, populating its internal street/number fields.
+      if (state.options.length === 0 && state.valid) return;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  }
+  throw new PreparationError('ADDRESS_SELECTION', {
+    addressType, reason: selected ? 'selection_invalid' : 'no_match',
+  });
+}
+
+async function fillAddress(form, index, street, addressType) {
+  const blocks = form.locator('aws');
+  if (await blocks.count() !== 2) throw new PreparationError('ADDRESS');
+  const block = blocks.nth(index);
+  await block.locator('bex-input[formcontrolname="streetAndLocation"] input').fill(street);
+  await resolveAddressSelection(
+    () => block.evaluate(el => ({
+      street: el.querySelector('bex-input[formcontrolname="streetAndLocation"] input')?.value || '',
+      options: [...el.querySelectorAll('[data-address-list] [role="option"]')].map(option => option.innerText.trim()),
+      valid: el.firstElementChild?.classList.contains('ng-valid') &&
+        !el.firstElementChild.classList.contains('ng-invalid') &&
+        !el.firstElementChild.classList.contains('ng-pending'),
+    })),
+    text => block.getByRole('option', { name: text, exact: true }).click(),
+    street, addressType,
+  );
+}
+
+// Runs in the browser. Return only fixed field names and statuses, never values.
+function inspectValidation(el) {
+  const problems = [];
+  const invalid = node => node?.classList.contains('ng-invalid') || node?.classList.contains('ng-pending');
+  const blocks = [...el.querySelectorAll('aws')];
+  blocks.forEach((block, index) => {
+    if (invalid(block.firstElementChild)) problems.push(index === 0 ? 'listing address group' : 'current address group');
+  });
+  const names = {
+    'Dit navn': 'name', 'Mailadresse': 'email', 'Dit telefonnummer': 'phone',
+    'Din fødselsdato': 'birth_date',
+    'Navn på evt. samlever, der også skal bo i boligen': 'partner_name',
+    'Fødselsdato på evt. samlever, der også skal bo i boligen': 'partner_birth_date',
+  };
+  for (const node of el.querySelectorAll('bex-input,bex-datepicker,bex-autocomplete')) {
+    if (!invalid(node)) continue;
+    const control = node.getAttribute('formcontrolname');
+    const addressIndex = blocks.findIndex(block => block.contains(node));
+    let name;
+    if (addressIndex >= 0 && ['zipCode', 'city', 'streetAndLocation'].includes(control)) {
+      name = `${addressIndex === 0 ? 'listing' : 'current'} ${control}`;
+    } else if (control === 'country') name = 'country';
+    else name = names[node.querySelector('label')?.textContent.trim()] || 'unidentified field';
+    const input = node.querySelector('input');
+    problems.push(name + (input && !input.value.trim() ? ' (empty)' : ' (invalid or pending)'));
+  }
+  return {
+    formState: el.classList.contains('ng-pending') ? 'pending' : el.classList.contains('ng-invalid') ? 'invalid'
+      : el.classList.contains('ng-valid') ? 'valid' : 'unknown',
+    problems: [...new Set(problems)],
+  };
 }
 
 function loadProfile(raw) {
@@ -146,8 +247,13 @@ async function fillApplication(page, address, profile) {
       validateCityMatch(expected.type, expected.postcode, expected.city, await cities.nth(i).inputValue());
     }
     stage = 'ADDRESS';
-    await streets.nth(0).fill(address.street);
-    await streets.nth(1).fill(profile.current_street);
+    await fillAddress(form, 0, address.street, 'listing');
+    await fillAddress(form, 1, profile.current_street, 'current');
+    // Selection must not change the requested postcode/city.
+    for (let i = 0; i < 2; i++) {
+      if (await postcodes.nth(i).inputValue() !== expectedAddresses[i].postcode) throw new PreparationError('ADDRESS_CHANGED');
+      validateCityMatch(expectedAddresses[i].type, expectedAddresses[i].postcode, expectedAddresses[i].city, await cities.nth(i).inputValue());
+    }
     stage = 'APPLICANT';
     // Labels are visually present but some inputs lack HTML label associations.
     for (const [label, value] of [
@@ -179,12 +285,17 @@ async function fillApplication(page, address, profile) {
     // inputs. Native checkValidity() therefore rejects legitimate text: use the
     // Angular form/control validity which the site's own Send action uses.
     stage = 'VALIDATION';
-    await page.waitForFunction(el =>
-      el.classList.contains('ng-valid') &&
-      !el.classList.contains('ng-invalid') &&
-      !el.classList.contains('ng-pending') &&
-      !el.querySelector('.ng-invalid,.ng-pending'),
-      await form.elementHandle(), { timeout: 20000 });
+    try {
+      await page.waitForFunction(el =>
+        el.classList.contains('ng-valid') &&
+        !el.classList.contains('ng-invalid') &&
+        !el.classList.contains('ng-pending') &&
+        !el.querySelector('.ng-invalid,.ng-pending'),
+        await form.elementHandle(), { timeout: 20000 });
+    } catch {
+      const details = await form.evaluate(inspectValidation).catch(() => null);
+      throw new PreparationError('VALIDATION', details);
+    }
     return page.getByRole('button', { name: 'Send', exact: true }).filter({ visible: true });
   } catch (error) {
     if (error instanceof PreparationError) throw error;
@@ -227,4 +338,4 @@ async function applyForHousing(address, profile, { dryRun = true, beforeSubmit =
   } finally { await browser.close().catch(() => {}); }
 }
 
-module.exports = { waitForCountrySelection, PreparationError, preparationReason, validateCityMatch, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };
+module.exports = { normalizeStreet, resolveAddressSelection, inspectValidation, fillAddress, waitForCountrySelection, PreparationError, preparationReason, validateCityMatch, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };

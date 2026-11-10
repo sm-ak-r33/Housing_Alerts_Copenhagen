@@ -2,7 +2,8 @@ const { chromium } = require('playwright');
 const FORM_URL = 'https://dab-lejerbo.dk/boligsoegende/tidsbegraensede-boliger/blanket-til-tidsbegraenset-bolig/';
 const SUBMIT_PATH = '/api/forms/SubmitForm';
 
-// Only fixed messages are exposed to Telegram; Playwright errors can contain PII.
+// Never expose raw Playwright errors. City diagnostics include only the relevant
+// postcode/city pair in the already-authorized Telegram chat, not logs.
 const PREPARATION_MESSAGES = Object.freeze({
   OPEN_FORM: 'The application page or form did not become ready.',
   COUNTRY: 'The country controls changed or are not set to Danmark.',
@@ -15,18 +16,36 @@ const PREPARATION_MESSAGES = Object.freeze({
   VALIDATION: 'The form did not become valid. Check applicant details and address lookup.',
 });
 class PreparationError extends Error {
-  constructor(code) {
+  constructor(code, details = null) {
     super(PREPARATION_MESSAGES[code]);
+    this.details = details;
     this.name = 'PreparationError';
     this.code = code;
   }
 }
 function preparationReason(error) {
-  return error instanceof PreparationError
-    ? `[${error.code}] ${PREPARATION_MESSAGES[error.code]}`
-    : '[PREPARATION_FAILED] Browser startup or an unexpected preparation step failed.';
+  if (!(error instanceof PreparationError)) {
+    return '[PREPARATION_FAILED] Browser startup or an unexpected preparation step failed.';
+  }
+  if (error.code === 'CITY_MISMATCH' && error.details) {
+    // Keep diagnostics single-line, bounded and restricted to known fields.
+    const safe = value => JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 100));
+    const { addressType, postcode, suppliedCity, siteCity } = error.details;
+    const current = addressType === 'current';
+    return `[CITY_MISMATCH] ${current ? 'Your current address' : 'The listing address'}: ` +
+      `postcode ${safe(postcode)}; supplied city ${safe(suppliedCity)}; site city ${safe(siteCity)}. ` +
+      (current
+        ? 'Check current_postcode and current_city in DAB_APPLICANT_JSON. If the postcode is correct, use the site city as current_city.'
+        : 'Check the postcode and city in your apply reply. If the postcode is correct, use the site city in that reply.');
+  }
+  return `[${error.code}] ${PREPARATION_MESSAGES[error.code]}`;
 }
 const normalizeCity = value => value.normalize('NFC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('da-DK');
+function validateCityMatch(addressType, postcode, suppliedCity, siteCity) {
+  if (normalizeCity(siteCity) !== normalizeCity(suppliedCity)) {
+    throw new PreparationError('CITY_MISMATCH', { addressType, postcode, suppliedCity, siteCity });
+  }
+}
 
 function loadProfile(raw) {
   let p;
@@ -90,11 +109,13 @@ async function fillApplication(page, address, profile) {
       const inputs = [...el.querySelectorAll('bex-input[formcontrolname="city"] input')];
       return inputs.length === 2 && inputs.every(input => input.disabled && input.value.trim());
     }, await form.elementHandle(), { timeout: 20000 });
-    const expectedCities = [address.city, profile.current_city];
+    const expectedAddresses = [
+      { type: 'listing', postcode: address.postcode, city: address.city },
+      { type: 'current', postcode: profile.current_postcode, city: profile.current_city },
+    ];
     for (let i = 0; i < 2; i++) {
-      if (normalizeCity(await cities.nth(i).inputValue()) !== normalizeCity(expectedCities[i])) {
-        throw new PreparationError('CITY_MISMATCH');
-      }
+      const expected = expectedAddresses[i];
+      validateCityMatch(expected.type, expected.postcode, expected.city, await cities.nth(i).inputValue());
     }
     stage = 'ADDRESS';
     await streets.nth(0).fill(address.street);
@@ -178,4 +199,4 @@ async function applyForHousing(address, profile, { dryRun = true, beforeSubmit =
   } finally { await browser.close().catch(() => {}); }
 }
 
-module.exports = { PreparationError, preparationReason, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };
+module.exports = { PreparationError, preparationReason, validateCityMatch, FORM_URL, loadProfile, confirmedResponse, fillApplication, applyForHousing };
